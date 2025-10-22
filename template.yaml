@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SAM: S3 -> EventBridge -> SQS -> Lambda (with DLQ, partial batch response, alarms).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: s3-eb-sqs
+  Stage:
+    Type: String
+    Default: dev
+  Region:
+    Type: String
+    Default: us-east-1
+  CreateBucket:
+    Type: String
+    Default: false
+    AllowedValues: ["true", "false"]
+  S3SourceBucket1:
+    Type: String
+    Description: First source bucket for bets data
+    Default: my-source-bucket-1
+  S3DataLakeBucket:
+    Type: String
+    Description: Data lake bucket for consolidated output (head_to_head.parquet)
+    Default: s3-bucket-dev-lake-analytics
+  S3PrefixFilter:
+    Type: String
+    Default: ""
+    Description: Optional key prefix to logically route/identify events (not enforced at EventBridge; filter can be done in Lambda).
+  SqsMaxReceiveCount:
+    Type: Number
+    Default: 3
+    Description: Maximum number of times a message can be received before moving to DLQ
+  LambdaMemorySize:
+    Type: Number
+    Default: 10240
+    Description: Lambda function memory size in MB
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 60
+    Description: Lambda function timeout in seconds (15 minutes)
+  LambdaConcurrencyLimit:
+    Type: Number
+    Default: 1
+    Description: Maximum concurrent Lambda executions (1 = sequential processing)
+  SqsBatchSize:
+    Type: Number
+    Default: 5
+    Description: Number of messages to process in a single Lambda invocation
+  SqsBatchWindowSeconds:
+    Type: Number
+    Default: 2
+    Description: Maximum time to wait for a full batch before invoking Lambda
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR, CRITICAL]
+  SqsVisibilityTimeoutSeconds:
+    Type: Number
+    Default: 180
+    Description: SQS message visibility timeout in seconds
+  EnableXRayTracing:
+    Type: String
+    Default: true
+    AllowedValues: ["true", "false"]
+    Description: Enable AWS X-Ray tracing for Lambda function
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    Description: Optional KMS key ARN to encrypt SQS. Leave empty to use SQS-managed SSE.
+  CreateSnsAlarmTopic:
+    Type: String
+    Default: false
+    AllowedValues: ["true", "false"]
+    Description: Create SNS topic for CloudWatch alarms
+  TagProject:
+    Type: String
+    Default: Llamabara
+    Description: Project tag for cost allocation
+  TagApplication:
+    Type: String
+    Default: head-to-head
+    Description: Application tag for resource identification
+
+Conditions:
+  IsProd: !Equals [!Ref Stage, "prod"]
+  CreateS3Bucket: !Equals [!Ref CreateBucket, "true"]
+  UseKms: !Not [!Equals [!Ref KmsKeyArn, ""]]
+  UseXRay: !Equals [!Ref EnableXRayTracing, "true"]
+  CreateSns: !Equals [!Ref CreateSnsAlarmTopic, "true"]
+
+Resources:
+  MainQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-main-queue"
+      VisibilityTimeout: !Ref SqsVisibilityTimeoutSeconds
+      KmsMasterKeyId: !If [UseKms, !Ref KmsKeyArn, !Ref "AWS::NoValue"]
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt Dlq.Arn
+        maxReceiveCount: !Ref SqsMaxReceiveCount
+      Tags:
+        - Key: Project
+          Value: !Ref TagProject
+        - Key: Application
+          Value: !Ref TagApplication
+        - Key: Environment
+          Value: !Ref Stage
+
+  Dlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-dlq"
+      KmsMasterKeyId: !If [UseKms, !Ref KmsKeyArn, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Project
+          Value: !Ref TagProject
+        - Key: Application
+          Value: !Ref TagApplication
+        - Key: Environment
+          Value: !Ref Stage
+
+  MainQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref MainQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToSend
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt MainQueue.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn: 
+                  - !Sub "arn:aws:s3:::${S3SourceBucket1}"
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSns
+    Properties:
+      TopicName: !Sub "${ProjectName}-alarms"
+      Tags:
+        - Key: Project
+          Value: !Ref TagProject
+        - Key: Application
+          Value: !Ref TagApplication
+        - Key: Environment
+          Value: !Ref Stage
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-dlq-has-messages"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Sum
+      Threshold: 1
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt Dlq.QueueName
+      AlarmDescription: "DLQ has at least 1 visible message."
+      AlarmActions: !If [CreateSns, [!Ref AlarmTopic], []]
+      Tags:
+        - Key: Project
+          Value: !Ref TagProject
+        - Key: Application
+          Value: !Ref TagApplication
+        - Key: Environment
+          Value: !Ref Stage
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-processor"
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: !Ref LambdaTimeoutSeconds
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: !Ref LambdaConcurrencyLimit
+      EphemeralStorage:
+        Size: 512
+      Tags:
+        Project: !Ref TagProject
+        Application: !Ref TagApplication
+        Environment: !Ref Stage
+      Layers:
+        - arn:aws:lambda:us-east-2:774305611583:layer:pythonPolarsLayer:10
+      Environment:
+        Variables:
+          PREFIX: !Ref S3PrefixFilter
+          LOG_LEVEL: !Ref LogLevel
+          DATA_BUCKET: !Ref S3DataLakeBucket
+          PROJECT_NAME: !Ref ProjectName
+          STAGE: !Ref Stage
+      Events:
+        SqsEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MainQueue.Arn
+            BatchSize: !Ref SqsBatchSize
+            MaximumBatchingWindowInSeconds: !Ref SqsBatchWindowSeconds
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      Tracing: !If [UseXRay, Active, !Ref "AWS::NoValue"]
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If 
+          - UseXRay
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref "AWS::NoValue"
+        - Statement:
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: 
+              - !Sub "arn:aws:s3:::${S3SourceBucket1}/*"
+        - Statement:
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:HeadObject
+            Resource: 
+              - !Sub "arn:aws:s3:::${S3DataLakeBucket}/*"
+        - Statement:
+            Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:ChangeMessageVisibility
+            Resource: !GetAtt MainQueue.Arn
+
+Outputs:
+  S3SourceBucket1:
+    Value: !Ref S3SourceBucket1
+  S3DataLakeBucket:
+    Value: !Ref S3DataLakeBucket
+  MainQueueUrl:
+    Value: !Ref MainQueue
+  DlqQueueUrl:
+    Value: !Ref Dlq
+  ProcessorFunctionName:
+    Value: !Ref ProcessorFunction
+  AlarmTopicArn:
+    Condition: CreateSns
+    Value: !Ref AlarmTopic

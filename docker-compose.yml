@@ -1,0 +1,13 @@
+services:
+  sam:
+    build: .
+    container_name: sam-cli
+    working_dir: /work
+    volumes:
+      - ./:/work
+      - ${USERPROFILE:-~}/.aws:/root/.aws:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - AWS_PROFILE=${AWS_PROFILE:-default}
+      - AWS_REGION=${AWS_REGION:-us-east-2}
+    tty: true
